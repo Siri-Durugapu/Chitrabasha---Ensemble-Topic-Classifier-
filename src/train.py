@@ -1,143 +1,203 @@
+"""
+Training pipeline for Chitrabasha hybrid text classifier.
+
+    python -m src.train
+"""
+
+import os
 import time
-import numpy as np
 import pickle
-from scipy.sparse import vstack, hstack
-from sklearn.model_selection import train_test_split
+import logging
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack, vstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
 
-from utils import load_data, preprocess_text
-from model import train_nb, train_lr, train_svm
+from src.utils import load_data, preprocess_text
+from src.model import train_nb, train_lr, train_svm
+from src.config import (
+    RANDOM_STATE, TEST_SIZE, VAL_SIZE,
+    TFIDF_WORD_FEATURES, TFIDF_CHAR_FEATURES,
+    TFIDF_WORD_NGRAM, TFIDF_CHAR_NGRAM,
+    ACTIVE_POOL_RATIO, ACTIVE_UNCERTAIN_K, ACTIVE_DISAGREE_K,
+    MODEL_DIR,
+    NB_PATH, LR_PATH, SVM_PATH, META_PATH, VEC_PATH, CLASSES_PATH,
+)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ── 1. Load & preprocess ──────────────────────────────────────────────────────
+
+logger.info("Loading data …")
 df = load_data()
 df["DATA"] = df["DATA"].apply(preprocess_text)
-
 y = df["TOPIC"]
 
-# TF-IDF 
-tfidf_word = TfidfVectorizer(max_features=15000, ngram_range=(1,2))
-tfidf_char = TfidfVectorizer(analyzer='char', ngram_range=(3,5), max_features=5000)
+# ── 2. TF-IDF vectorisation ───────────────────────────────────────────────────
+
+logger.info("Fitting TF-IDF vectorisers …")
+tfidf_word = TfidfVectorizer(
+    max_features=TFIDF_WORD_FEATURES,
+    ngram_range=TFIDF_WORD_NGRAM,
+)
+tfidf_char = TfidfVectorizer(
+    analyzer="char",
+    ngram_range=TFIDF_CHAR_NGRAM,
+    max_features=TFIDF_CHAR_FEATURES,
+)
 
 X_word = tfidf_word.fit_transform(df["DATA"])
 X_char = tfidf_char.fit_transform(df["DATA"])
 X = hstack([X_word, X_char])
 
-# SPLIT 
-X_train_full, X_test, y_train_full, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
+# ── 3. Stratified train / val / test split ────────────────────────────────────
+
+X_dev, X_test, y_dev, y_test = train_test_split(
+    X, y,
+    test_size=TEST_SIZE,
+    stratify=y,
+    random_state=RANDOM_STATE,
+)
+
+val_frac = VAL_SIZE / (1 - TEST_SIZE)
+X_trainpool, X_val, y_trainpool, y_val = train_test_split(
+    X_dev, y_dev,
+    test_size=val_frac,
+    stratify=y_dev,
+    random_state=RANDOM_STATE,
 )
 
 X_train, X_pool, y_train, y_pool = train_test_split(
-    X_train_full, y_train_full, test_size=0.3, stratify=y_train_full, random_state=42
+    X_trainpool, y_trainpool,
+    test_size=ACTIVE_POOL_RATIO,
+    stratify=y_trainpool,
+    random_state=RANDOM_STATE,
 )
 
-start_time = time.time()
+logger.info(
+    "Split → train: %d | pool: %d | val: %d | test: %d",
+    X_train.shape[0], X_pool.shape[0], X_val.shape[0], X_test.shape[0],
+)
 
-# BASE MODELS 
-nb = train_nb(X_train, y_train)
-lr = train_lr(X_train, y_train)
+# ── 4. Base model training ────────────────────────────────────────────────────
+
+logger.info("Training base models …")
+t0  = time.time()
+nb  = train_nb(X_train, y_train)
+lr  = train_lr(X_train, y_train)
 svm = train_svm(X_train, y_train)
+logger.info("Base models trained in %.2f s", time.time() - t0)
 
-end_time = time.time()
+for name, model in [("Naive Bayes", nb), ("Logistic Regression", lr), ("SVM", svm)]:
+    print(f"\n── {name} ──")
+    print(classification_report(y_test, model.predict(X_test), zero_division=0))
 
-training_time = end_time - start_time
+# ── 5. Active learning (uncertainty + disagreement sampling) ──────────────────
 
-print(f"Training Time: {training_time:.2f} seconds")
+logger.info("Running active learning …")
+lr_probs_pool = lr.predict_proba(X_pool)
+nb_pred_pool  = nb.predict(X_pool)
+lr_pred_pool  = lr.predict(X_pool)
 
-print("\nNAIVE BAYES RESULTS:\n")
-print(classification_report(y_test, nb.predict(X_test), zero_division=0))
+uncertainty   = 1 - np.max(lr_probs_pool, axis=1)
+disagreement  = nb_pred_pool != lr_pred_pool
 
-print("\nLOGISTIC REGRESSION RESULTS:\n")
+uncertain_idx = np.argsort(uncertainty)[-ACTIVE_UNCERTAIN_K:]
+disagree_idx  = np.where(disagreement)[0][:ACTIVE_DISAGREE_K]
+hard_idx      = np.unique(np.concatenate([uncertain_idx, disagree_idx]))
+
+X_train_al = vstack([X_train, X_pool[hard_idx]])
+y_train_al = np.concatenate([y_train, y_pool.iloc[hard_idx]])
+
+lr = train_lr(X_train_al, y_train_al)
+
+print("\n── LR after active learning ──")
 print(classification_report(y_test, lr.predict(X_test), zero_division=0))
 
-print("\nSVM RESULTS:\n")
-print(classification_report(y_test, svm.predict(X_test), zero_division=0))
+# ── 6. Meta-model (trained on val predictions — no leakage) ──────────────────
 
-# ACTIVE LEARNING 
-lr_probs = lr.predict_proba(X_pool)
-nb_pred_pool = nb.predict(X_pool)
-lr_pred_pool = lr.predict(X_pool)
+logger.info("Building meta-model on validation set …")
+nb_probs_val = nb.predict_proba(X_val)
+lr_probs_val = lr.predict_proba(X_val)
+nb_pred_val  = nb.predict(X_val)
+lr_pred_val  = lr.predict(X_val)
+svm_pred_val = svm.predict(X_val)
 
-uncertainty = 1 - np.max(lr_probs, axis=1)
-disagreement = (nb_pred_pool != lr_pred_pool)
-
-uncertain_idx = np.argsort(uncertainty)[-5000:]
-disagree_idx = np.where(disagreement)[0][:5000]
-
-hard_idx = np.unique(np.concatenate([uncertain_idx, disagree_idx]))
-
-X_hard = X_pool[hard_idx]
-y_hard = y_pool.iloc[hard_idx]
-
-X_train_new = vstack([X_train, X_hard])
-y_train_new = np.concatenate([y_train, y_hard])
-
-lr = train_lr(X_train_new, y_train_new)
-
-print("\nLOGISTIC REGRESSION AFTER ACTIVE LEARNING:\n")
-print(classification_report(y_test, lr.predict(X_test), zero_division=0))
-
-# META MODEL 
-nb_probs = nb.predict_proba(X_test)
-lr_probs = lr.predict_proba(X_test)
-
-nb_pred = nb.predict(X_test)
-lr_pred = lr.predict(X_test)
-svm_pred = svm.predict(X_test)
-
-meta_X, meta_y = [], []
-
-for i in range(len(nb_pred)):
-    nb_conf = np.max(nb_probs[i])
-    lr_conf = np.max(lr_probs[i])
-
-    meta_X.append([
-        nb_conf,
-        lr_conf,
-        int(nb_pred[i] == lr_pred[i]),
-        int(lr_pred[i] == svm_pred[i])
-    ])
-
-    # choose better model
-    if lr_pred[i] == y_test.iloc[i]:
-        meta_y.append(1)
-    else:
-        meta_y.append(0)
+meta_X = [
+    [
+        float(np.max(nb_probs_val[i])),
+        float(np.max(lr_probs_val[i])),
+        int(nb_pred_val[i] == lr_pred_val[i]),
+        int(lr_pred_val[i] == svm_pred_val[i]),
+    ]
+    for i in range(len(nb_pred_val))
+]
+meta_y = [
+    1 if lr_pred_val[i] == y_val.iloc[i] else 0
+    for i in range(len(nb_pred_val))
+]
 
 meta = train_lr(np.array(meta_X), meta_y)
 
-# FINAL PREDICTION
+# ── 7. Final hybrid evaluation on test set ────────────────────────────────────
+
+logger.info("Evaluating final hybrid on test set …")
+nb_probs_test = nb.predict_proba(X_test)
+lr_probs_test = lr.predict_proba(X_test)
+nb_pred_test  = nb.predict(X_test)
+lr_pred_test  = lr.predict(X_test)
+svm_pred_test = svm.predict(X_test)
+
 final_preds = []
+for i in range(len(nb_pred_test)):
+    votes = [nb_pred_test[i], lr_pred_test[i], svm_pred_test[i]]
 
-for i in range(len(nb_pred)):
-    votes = [nb_pred[i], lr_pred[i], svm_pred[i]]
-
-    if votes.count(votes[0]) > 1:
-        final_preds.append(votes[0])
-    elif votes.count(votes[1]) > 1:
-        final_preds.append(votes[1])
+    if votes.count(nb_pred_test[i]) > 1:
+        final_preds.append(nb_pred_test[i])
+    elif votes.count(lr_pred_test[i]) > 1:
+        final_preds.append(lr_pred_test[i])
     else:
-        nb_conf = np.max(nb_probs[i])
-        lr_conf = np.max(lr_probs[i])
-
-        choice = meta.predict([[
-            nb_conf,
-            lr_conf,
-            int(nb_pred[i] == lr_pred[i]),
-            int(lr_pred[i] == svm_pred[i])
+        nb_conf = float(np.max(nb_probs_test[i]))
+        lr_conf = float(np.max(lr_probs_test[i]))
+        choice  = meta.predict([[
+            nb_conf, lr_conf,
+            int(nb_pred_test[i] == lr_pred_test[i]),
+            int(lr_pred_test[i] == svm_pred_test[i]),
         ]])[0]
+        final_preds.append(nb_pred_test[i] if choice == 0 else lr_pred_test[i])
 
-        final_preds.append(nb_pred[i] if choice == 0 else lr_pred[i])
-
-print("\nFINAL RESULTS:\n")
+print("\n── Final hybrid results ──")
 print(classification_report(y_test, final_preds, zero_division=0))
 
-pickle.dump(nb, open("final_models/nb.pkl", "wb"))
-pickle.dump(lr, open("final_models/lr.pkl", "wb"))
-pickle.dump(svm, open("final_models/svm.pkl", "wb"))
-pickle.dump(meta, open("final_models/meta.pkl", "wb"))
-pickle.dump((tfidf_word, tfidf_char), open("final_models/vectorizer.pkl", "wb"))
+# ── 8. Save test results ──────────────────────────────────────────────────────
 
+os.makedirs(MODEL_DIR, exist_ok=True)
 
+results_path = os.path.join(MODEL_DIR, "test_results.csv")
+pd.DataFrame({"actual": y_test, "predicted": final_preds}).to_csv(results_path, index=False)
+logger.info("Test results saved to %s", results_path)
 
+# ── 9. Save model artefacts ───────────────────────────────────────────────────
 
+logger.info("Saving model artefacts …")
+for obj, path in [
+    (nb,                     NB_PATH),
+    (lr,                     LR_PATH),
+    (svm,                    SVM_PATH),
+    (meta,                   META_PATH),
+    ((tfidf_word, tfidf_char), VEC_PATH),
+    (list(y.unique()),       CLASSES_PATH),
+]:
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+logger.info("All artefacts saved to %s/", MODEL_DIR)

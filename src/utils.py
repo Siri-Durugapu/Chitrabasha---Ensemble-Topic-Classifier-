@@ -1,43 +1,61 @@
-import pandas as pd
 import re
-import pyarrow.parquet as pq
 import random
+import logging
 
-random.seed(42)
+import pandas as pd
+import pyarrow.parquet as pq
 
-def load_data(sample_size=100000):
-    parquet_file = pq.ParquetFile("data/dataset_10M.parquet")
-    dfs = []
-    total = 0
+from src.config import DATA_PATH, SAMPLE_SIZE, RANDOM_STATE
 
-    while total < sample_size:
-        rg = random.randint(0, parquet_file.num_row_groups - 1)
-        table = parquet_file.read_row_group(rg, columns=["DATA", "TOPIC"])
-        df_chunk = table.to_pandas()
-        dfs.append(df_chunk)
-        total += len(df_chunk)
+logger = logging.getLogger(__name__)
+random.seed(RANDOM_STATE)
 
-    df = pd.concat(dfs).sample(n=sample_size, random_state=42)
 
-    counts = df["TOPIC"].value_counts()
-    min_count = min(1000, counts.min())
+def load_data(
+    path: str = DATA_PATH,
+    sample_size: int = SAMPLE_SIZE,
+) -> pd.DataFrame:
+    """
+    Stream-read the Parquet dataset row-group by row-group until we have
+    at least `sample_size` rows, then random-sample down to exactly that
+    number.  This keeps peak memory low even for multi-GB files.
+    """
+    parquet_file = pq.ParquetFile(path)
+    n_row_groups = parquet_file.num_row_groups
+    logger.info("Parquet file has %d row groups.", n_row_groups)
 
-    df = df.groupby("TOPIC").apply(
-        lambda x: x.sample(n=min(len(x), min_count), random_state=42)
-        ).reset_index(drop=True)
+    chunks, total_rows = [], 0
+    for rg in range(n_row_groups):
+        chunk = parquet_file.read_row_group(rg, columns=["DATA", "TOPIC"]).to_pandas()
+        chunks.append(chunk)
+        total_rows += len(chunk)
+        if total_rows >= sample_size:
+            break
 
-    print("\nClass Distribution:\n", df["TOPIC"].value_counts())
+    df = pd.concat(chunks, ignore_index=True)
 
+    if len(df) > sample_size:
+        df = df.sample(n=sample_size, random_state=RANDOM_STATE).reset_index(drop=True)
+
+    logger.info("Loaded %d samples across %d classes.", len(df), df["TOPIC"].nunique())
+    logger.info("Class distribution:\n%s", df["TOPIC"].value_counts().to_string())
     return df
 
 
-def clean_text(text):
+# ── Text cleaning ─────────────────────────────────────────────────────────────
+
+_URL_RE    = re.compile(r"https?://\S+|www\.\S+")
+_NONALPHA  = re.compile(r"[^a-z ]")
+_SPACES    = re.compile(r"\s+")
+
+
+def clean_text(text: str) -> str:
     text = str(text).lower()
-    text = re.sub(r'http\S+|www\S+', '', text)
-    text = re.sub(r'[^a-z ]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = _URL_RE.sub(" ", text)
+    text = _NONALPHA.sub(" ", text)
+    text = _SPACES.sub(" ", text).strip()
     return text
 
 
-def preprocess_text(text):
+def preprocess_text(text: str) -> str:
     return clean_text(text)
