@@ -9,7 +9,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(__file__))
 from _theme import inject_css, theme_toggle_sidebar, get_mode
 
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+API_URL = os.environ.get("API_URL", "https://chitrabasha-api.onrender.com")
 
 st.set_page_config(
     page_title="Chitrabasha",
